@@ -1,0 +1,732 @@
+<?php
+
+namespace App\Http\Controllers\Api\V1;
+
+use App\Events\Frontend\Order\orderCreate;
+use App\Events\Frontend\Order\orderUpdate;
+use App\Http\Requests\Shop\CheckDriverRequest;
+use App\Http\Requests\Shop\ClientOrdersRequest;
+use App\Http\Requests\Shop\GetOrderTimeFormatRequest;
+use App\Http\Requests\Shop\OrderComplainRequest;
+use App\Http\Requests\Shop\OrderRequest;
+use App\Http\Requests\Shop\OrderUpdateRequest;
+use App\Http\Requests\Shop\SkipOrderProcessRequest;
+use App\Models\Contact\Contact;
+use App\Models\Coupon\Coupon;
+use App\Models\Locations\Location;
+use App\Models\Device\Device;
+use App\Models\LaundryUser\LaundryUser;
+use App\Models\Order\Order;
+use App\Models\Orderdetail\Orderdetail;
+use App\Models\Product\Product;
+use App\Models\Settings\Setting;
+use App\Models\Voted_Location\Votedlocation;
+use Carbon\Carbon;
+use Grimzy\LaravelMysqlSpatial\Types\Point;
+use Illuminate\Http\Request;
+use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\DB;
+use Unisharp\FileApi\FileApi;
+use LaravelFCM\Facades\FCM;
+use LaravelFCM\Message\OptionsBuilder;
+use LaravelFCM\Message\PayloadDataBuilder;
+use LaravelFCM\Message\PayloadNotificationBuilder;
+
+/**
+ * @resource Orders
+ *
+ * All orders related functions
+ */
+class OrderController extends Controller
+{
+    /**
+     * Enforce middleware.
+     */
+    public function __construct()
+    {
+        $this->middleware('shop.open',
+            ['only' => ['create', 'store', 'skipOrderProcess']]);
+    }
+
+    /**
+     * Display a listing of the resource.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function index(ClientOrdersRequest $request)
+    {
+        return $this->clientOrders($request);
+    }
+
+    /**
+     * Show the form for creating a new resource.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function create()
+    {
+        //
+    }
+
+    /**
+     * Store a newly created resource in storage.
+     *
+     * @param  \Illuminate\Http\Request $request
+     * @return \Illuminate\Http\Response
+     * products[0][id]:3
+     * products[0][service_id]:2
+     * products[0][qty]:2
+     * products[0][price]:289
+     * products[1][id]:4
+     * products[1][qty]:2
+     * products[1][price]:255
+     * products[1][service_id]:2
+     * payment_method:cod
+     * pickup_time:12-03-2018 19:00
+     * delivery_time:12-04-2018 19:00
+     * address:144 Khurrram block, Canal bank, Lahore
+     * lat:25.58151518181
+     * lng:2.33558282
+     */
+    public function store(OrderRequest $request)
+    {
+
+        if (empty(\Auth::user()->phone)) {
+            return response()->json([
+                'error' => [
+                    'error_title' => trans('api.error_title'),
+                    'message' => 'Please update your mobile number first from profile section.',
+                    'status_code' => 422
+                ]
+            ], 422);
+        }
+        $dday = date("d",strtotime($request->get('delivery_time')));
+        $pday = date("d",strtotime($request->get('pickup_time')));
+        if($dday == $pday){
+            return response()->json([
+                'error' => [
+                    'error_title' => trans('api.error_title'),
+                    'message' => 'Pickup and Delivery Day can not be same.',
+                    'status_code' => 422
+                ]
+            ], 422);
+        }
+        if($dday < $pday){
+            return response()->json([
+                'error' => [
+                    'error_title' => trans('api.error_title'),
+                    'message' => 'Delivery Day can not be less than Pickup day and time.',
+                    'status_code' => 422
+                ]
+            ], 422);
+        }
+
+        $lat = $request->get('lat');
+        $lng = $request->get('lng');
+        if($lat != null){
+            $geocode=file_get_contents('https://maps.googleapis.com/maps/api/geocode/json?latlng='.$lat.','.$lng.'&sensor=false&key=AIzaSyBiISc2o96q9Jvr_l_VQ86aqCW6UAsYALw');
+            $output= json_decode($geocode);
+            $city = null;
+            for($j=0;$j<count($output->results[0]->address_components);$j++){
+                $cn=array($output->results[0]->address_components[$j]->types[0]);
+                if(in_array("country", $cn)){
+                    $country_long_name= $output->results[0]->address_components[$j]->long_name;
+                    $country_short_name= $output->results[0]->address_components[$j]->short_name;
+                }
+                if(in_array("locality", $cn)){
+                    $city= $output->results[0]->address_components[$j]->long_name;
+                }
+            }
+        }else{
+            $country_long_name = "Saudi Arabia";
+            $country_short_name = "SA";
+            $city = "";
+        }
+        $location = Location::where('name',$country_long_name)->first();
+
+        $couponId = (!empty($request->get('coupon_id'))) ? $request->get('coupon_id') : NULL;
+        $driverId = 0;
+        $driverQuery = LaundryUser::where(\DB::raw("ST_Within(ST_PointFromText('POINT($lat $lng)'), driver_area)"), '=', 1)->first();
+        if (!empty($driverQuery)) {
+            $driverId = $driverQuery->user_id;
+        }
+        $order = new Order();
+        $lastOrder = $order->orderBy('id', 'DESC')->first();
+        $order->lat_lng = new Point($lat, $lng);
+        $order->user_id = \Auth::id();
+        $order->invoice_num = (!empty($lastOrder)) ? $lastOrder->id + 1 : 1;
+        $order->delivery_time = $request->get('delivery_time');
+        $order->pickup_time = $request->get('pickup_time');
+        $order->payment_method = $request->get('payment_method');
+        $order->address = $request->get('address');
+        $order->skip_by_client = '0';
+        $order->user_comments = $request->get('user_comments');
+        $order->driver_id = ($driverId == 0) ? $request->get('driver_id') : $driverId;
+        $order->payment_method = $request->get('payment_method');
+        $order->coupon_id = $couponId;
+        $orderPrice = $this->getCartInfo($request->get('products'),$location);
+        $order->subtotal = $orderPrice['subtotal'];
+        $order->delivery_charges = $orderPrice['delivery_charges'];
+        $order->sorting_fee = 0;
+        //Applying coupon
+        $couponInfo = $this->applyCoupon($couponId, $orderPrice['subtotal']);
+        $order->discount = $couponInfo['discount_val'];
+        $order->discount_type = $couponInfo['discount_type'];
+        $order->orderstatus_id = Order::PENDING;
+        $order->total = ($orderPrice['subtotal'] + $orderPrice['delivery_charges'] + 0) - $couponInfo['applied_discount'];
+        $order->laundry_total_price = $orderPrice['laundry_total_price'];
+        $order->save();
+        $order->id;
+        $order->detail()->delete();
+        $order->detail()->saveMany($this->makeOrderDetail($request->get('products'),null,$location));
+        event(new orderCreate($order));
+        $push_notification = $this->sendNotification($order->id);
+        return response()->json(['order' => $order,
+            'message' => trans('order.placed.success_message'),
+            'message_title' => trans('order.placed.success_message_title'),
+            'notification'  => $push_notification
+        ]);
+    }
+
+    /**
+     * Display the specified resource.
+     *
+     * @param  int $id
+     * @return \Illuminate\Http\Response
+     */
+    public function show($id)
+    {
+        $order = Order::where('id', $id)
+            ->with(['status' => function ($q1) {
+                $q1->select('id', 'status_description', 'status_description_ar');
+            }, 'detail' => function ($q) {
+                $q->with('product', 'service');
+            }])->first();
+        return response()->json($order);
+    }
+
+    /**
+     * Show the form for editing the specified resource.
+     *
+     * @param  int $id
+     * @return \Illuminate\Http\Response
+     */
+    public function edit($id)
+    {
+        //
+    }
+
+    /**
+     * Update the specified resource in storage.
+     *
+     * @param  \Illuminate\Http\Request $request
+     * @param  int $id
+     * @return \Illuminate\Http\Response
+     */
+    public function update(OrderUpdateRequest $request, $id)
+    {
+        $order = Order::find($id);
+//        if (in_array($order->orderstatus_id, [Order::JUST_ORDERED, Order::PENDING])) {
+//            return response()->json(['order' => $order,
+//                'message' => 'Your can not canel this order at this stage',
+//                'message_title' => 'Hurrah!'
+//            ]);
+//        }
+        $order->orderstatus_id = $request->get('orderstatus_id');
+        $order->save();
+        $push_notification = $this->sendNotification($order->id);
+        return response()->json([
+            'order' => $order,
+            'message' => trans('order.updated.success_message'),
+            'message_title' => trans('order.updated.success_message_title'),
+            'notification'  => $push_notification
+        ]);
+    }
+
+    /**
+     * Remove the specified resource from storage.
+     *
+     * @param  int $id
+     * @return \Illuminate\Http\Response
+     */
+    public function destroy($id)
+    {
+        //
+    }
+
+    /**
+     * Return discounted price
+     * @param $couponId
+     * @param $price
+     * @return mixed
+     */
+    public function applyCoupon($couponId = NULL, $price)
+    {
+        if (empty($couponId)) {
+            $data['discount'] = (double)0;
+            $data['applied_discount'] = (double)0;
+            $data['discount_val'] = (double)0;
+            $data['discount_type'] = NULL;
+            return $data;
+        }
+
+        $actualPrice = $price;
+        $coupon = [];
+        $coupon['discount'] = 0;
+        $discount = 0;
+        $coupon = Coupon::where('id', $couponId)
+            ->select('discount', 'discount_type', 'id')
+            ->where('valid_from', '<=', Carbon::now())
+            ->where('valid_till', '>=', Carbon::now())
+            ->where('min_purchase', '<=', $price)
+            ->orderBy('id', 'desc')
+            ->first();
+        $data['discount_type'] = NULL;
+        if (!empty($coupon)) {
+            $coupon = $coupon->toArray();
+            if ($coupon['discount_type'] == Coupon::PERCENTAGE) {
+                $discount = $actualPrice - ($actualPrice * ($coupon['discount'] / 100));
+            } else {
+                $discount = $actualPrice - $coupon['discount'];
+            }
+            $data['discount_type'] = $coupon['discount_type'];
+        }
+
+        $discount = abs(round($discount, 0));
+        $data['discount'] = $discount;
+        $data['applied_discount'] = abs($discount - $actualPrice);
+        $data['discount_val'] = (double)empty($coupon['discount']) ? 0 : $coupon['discount'];
+        return $data;
+    }
+
+    public
+    function getCartInfo($orderProducts,$location = null)
+    {
+        \Cart::destroy();
+        $where = '';
+
+        foreach ($orderProducts as $key => $val) {
+            if($location !=null)
+            $location_id = $location->id;
+            else
+            $location_id = $val['location_id'];
+            if ($key == 0) {
+                $where .= " WHERE (ps.product_id = " . $val['id'] . " AND ps.service_id = " . $val['service_id'] . " AND ps.location_id = " . $location_id . ") ";
+            } else {
+                $where .= " OR (ps.product_id = " . $val['id'] . " AND ps.service_id = " . $val['service_id'] . " AND ps.service_id = " . $val['service_id'] . " AND ps.location_id = " . $location_id . ") ";
+            }
+        }
+        $sql = "SELECT ps.*, p.name AS product_name, s.name AS service_name FROM product_service ps
+                JOIN products p ON p.id = ps.product_id
+                JOIN services s ON s.id = ps.service_id
+                $where";
+        $productsPurchased = DB::select($sql);
+        $orderDetail = [];
+        $laundryTotalPrice = 0;
+        $subtotal = 0;
+        foreach ($productsPurchased as $key => $val) {
+            $orderDetail[$key]['id'] = $val->product_id;
+            $orderDetail[$key]['name'] = $val->product_name;
+            $orderDetail[$key]['qty'] = $orderProducts[$this->array_find($val->product_id, $orderProducts, 'id')]['qty'];
+            $orderDetail[$key]['price'] = (!empty($val->discounted_price)) ? $val->discounted_price : $val->price;
+            $orderDetail[$key]['options']['service_id'] = $val->service_id;
+            $laundryTotalPrice = $laundryTotalPrice + ($val->laundry_price * $orderDetail[$key]['qty']);
+            $subtotal = $subtotal + ($orderDetail[$key]['price'] * $orderDetail[$key]['qty']);
+        }
+        \Cart::add($orderDetail);
+        $location = Location::find($location_id);
+        $cartInfo['subtotal'] = round($subtotal,1);//\Cart::subtotal(0, '', '');
+        $cartInfo['laundry_total_price'] = $laundryTotalPrice;
+        $settings = Setting::select(['is_shop_close', 'delievery_margin', 'close_time', 'open_time','delivery_charges'])->first();
+        $delivery_charges = json_decode($settings->delivery_charges,true);
+        $cartInfo['delivery_charges'] = $delivery_charges[$location->currency_code];
+        // $cartInfo['delivery_charges'] = \Config::get('constants.delivery_charges');
+        //$cartInfo['total'] = \Cart::total(0, '', '') + $cartInfo['delivery_charges'];
+        $cartInfo['total'] = $subtotal + $cartInfo['delivery_charges'];
+        return $cartInfo;
+    }
+
+    public
+    function makeOrderDetail($orderProducts, $orderId = null,$location= null)
+    {
+        $where = '';
+
+        foreach ($orderProducts as $key => $val) {
+            if($location !=null)
+            $location_id = $location->id;
+            else
+            $location_id = $val['location_id'];
+            if ($key == 0) {
+                $where .= " WHERE (ps.product_id = " . $val['id'] . " AND ps.service_id = " . $val['service_id'] . " AND ps.service_id = " . $val['service_id'] . " AND ps.location_id = " . $location_id . ") ";
+            } else {
+                $where .= " OR (ps.product_id = " . $val['id'] . " AND ps.service_id = " . $val['service_id'] . " AND ps.service_id = " . $val['service_id'] . " AND ps.location_id = " . $location_id . ") ";
+            }
+        }
+        $sql = "SELECT ps.*, p.name AS product_name, s.name AS service_name FROM product_service ps
+                JOIN products p ON p.id = ps.product_id
+                JOIN services s ON s.id = ps.service_id
+                $where";
+        $productsPurchased = DB::select($sql);
+        $orderDetail = [];
+        $orderDetailModel = [];
+        foreach ($productsPurchased as $key => $val) {
+            $orderDetail['product_id'] = $val->product_id;
+            $orderDetail['qty'] = $orderProducts[$this->array_find($val->product_id, $orderProducts, 'id')]['qty'];
+            $orderDetail['price'] = $val->price;
+            $orderDetail['service_id'] = $val->service_id;
+            $orderDetail['location_id'] = $val->location_id;
+            $orderDetail['paid_price'] = (!empty($val->discounted_price)) ? $val->discounted_price : $val->price;
+            $orderDetail['total_paid_price'] = round(($orderDetail['paid_price'] * $orderDetail['qty']),1);
+            $orderDetail['total_paid_laundry_price'] = round(($val->laundry_price * $orderDetail['qty']),1);
+            $orderDetail['added_by'] = \Auth::id();
+            $orderDetailModel[] = new Orderdetail($orderDetail);
+        }
+        return $orderDetailModel;
+    }
+
+    /**
+     * Return client orders.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function clientOrders(ClientOrdersRequest $request)
+    {
+        $status = $request->get('status');
+        $orderRes = Order::with(['status' => function ($q1) {
+            $q1->select('id', 'status_description', 'status_description_ar');
+        }, 'detail' => function ($q) {
+            $q->with('product', 'service');
+        }])->where('user_id', \Auth::id());
+        switch ($status) {
+            case 'active':
+                $orderRes = $orderRes->whereNotIn('orderstatus_id', [
+                    Order::CANCELLED,
+                    Order::COMPLETED,
+                    Order::DELIVERED
+                ]);
+                break;
+            case 'completed':
+                $orderRes = $orderRes->whereIn('orderstatus_id', [Order::DELIVERED,Order::COMPLETED]);
+                break;
+            default:
+                $orderRes = ['message' => 'invalid status'];
+        }
+        $orderRes = $orderRes->get();
+        //dd($orderRes->toArray());
+        if (!empty($orderRes)) {
+            foreach ($orderRes->toArray() as $key => $val) {
+                //$orderRes[$key]['created_at'] = date("d/m/Y g:i a", strtotime($val['created_at']));
+            }
+        }
+        if (empty($orderRes)) {
+            return response()->json(['error' => [
+                'error_title' => trans('api.error_title'),
+                'message' => 'No record found.',
+                'status_code' => 422
+            ],]);
+        }
+        return response()->json($orderRes);
+    }
+
+    /**
+     * Return client orders.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function clientOrdersTest(ClientOrdersRequest $request)
+    {
+        $status = $request->get('status');
+        $orderRes = Order::with(['status' => function ($q1) {
+            $q1->select('id', 'status_description', 'status_description_ar');
+        }, 'detail' => function ($q) {
+            $q->with('product', 'service');
+        }])->where('user_id', $request->get('user_id'));
+        switch ($status) {
+            case 'active':
+                $orderRes = $orderRes->whereNotIn('orderstatus_id', [
+                    Order::CANCELLED,
+                    Order::COMPLETED,
+                    Order::DELIVERED
+                ]);
+                break;
+            case 'completed':
+                $orderRes = $orderRes->whereIn('orderstatus_id', [Order::DELIVERED,Order::COMPLETED]);
+                break;
+            default:
+                $orderRes = ['message' => 'invalid status'];
+        }
+        $orderRes = $orderRes->get();
+        //dd($orderRes->toArray());
+        if (!empty($orderRes)) {
+            foreach ($orderRes->toArray() as $key => $val) {
+                //$orderRes[$key]['created_at'] = date("d/m/Y g:i a", strtotime($val['created_at']));
+            }
+        }
+        if (empty($orderRes)) {
+            return response()->json(['error' => [
+                'error_title' => trans('api.error_title'),
+                'message' => 'No record found.',
+                'status_code' => 422
+            ],]);
+        }
+        return response()->json($orderRes);
+    }
+
+    /**
+     * Register order complain.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public
+    function orderComplain(OrderComplainRequest $request)
+    {
+        $orderId = $request->get('order_id');
+        $feedback['images'] = [];
+        if ($request->has('complain_images')) {
+            $picPath = 'public/complains';
+            foreach ($request->file('complain_images') as $key => $val) {
+                $fileApi = new FileApi($picPath);
+                $feedback['images'][] = str_replace('public/', 'storage/', $picPath) . '/' . $fileApi->save($val);
+            }
+        }
+        $feedback['description'] = $request->get('description');
+        //Sending email
+        $user = \Auth::user();
+        //saving in database
+        Contact::create([
+            'description' => $feedback['description'],
+            'complain_images' => json_encode($feedback['images']),
+            'user_id' => $user->id,
+            'order_id' => $orderId
+        ]);
+        $feedback['user_name'] = $user->first_name;
+        $feedback['phone'] = $user->phone;
+        \Mail::send('emails.email_feedback', $feedback, function ($message) use ($user, $request) {
+            $message->from($user->email, $user->name)
+                ->to(\Config::get('constants.owners'))
+                ->subject('Client Feedback || SW')
+                ->bcc(\Config::get('constants.testers'))
+                ->replyTo($user->email, $user->name);
+        });
+        return response()->json([
+            'success' => true,
+            'message' => 'Complain sent to SmartWashr support.',
+            'message_title' => 'Success'
+        ]);
+    }
+
+    /**
+     * Check driver on given lat lng.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public
+    function checkDriver(CheckDriverRequest $request)
+    {
+        $lat = $request->get('lat');
+        $lng = $request->get('lng');
+
+
+        $driver = LaundryUser::where(
+            \DB::raw("ST_Within(ST_PointFromText('POINT($lat $lng)'), driver_area)"), '>=', 1
+        )
+            ->select('user_id')
+            ->first();
+        $messasge = '';
+        $success = true;
+        if (empty($driver)) {
+            $votedLocation = new Votedlocation();
+            $votedLocation->user_id = \Auth::id();
+            $votedLocation->location = new Point($lat, $lng);
+            $votedLocation->save();
+            $messasge = 'Sorry, We do not operate in your area . ';
+            $success = false;
+            return response()->json([
+                'driver' => null,
+                'error' => [
+                    'error_title' => trans('api.error_title'),
+                    'message' => $messasge,
+                    'status_code' => 422
+                ],
+                'success' => $success
+            ]);
+        }
+        return response()->json([
+            'driver' => $driver,
+            'message' => $messasge,
+            'success' => $success
+        ]);
+    }
+
+
+    function array_find($needle, array $haystack, $column = null)
+    {
+        if (is_array($haystack[0]) === true) { // check for multidimentional array
+
+            foreach (array_column($haystack, $column) as $key => $value) {
+                if (strpos(strtolower($value), strtolower($needle)) !== false) {
+                    return $key;
+                }
+            }
+        } else {
+            foreach ($haystack as $key => $value) { // for normal array
+                if (strpos(strtolower($value), strtolower($needle)) !== false) {
+                    return $key;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Skip order process by client
+     * @param SkipOrderProcessRequest $request
+     * @return \Illuminate\Http\JsonResponse
+     */
+    public
+    function skipOrderProcess(SkipOrderProcessRequest $request)
+    {
+        $lat = $request->get('lat');
+        $lng = $request->get('lng');
+        $couponId = (!empty($request->get('coupon_id'))) ? $request->get('coupon_id') : NULL;
+
+//        $driverId = 0;
+//
+//        $driverQuery = LaundryUser::where(
+//            \DB::raw("ST_Within(ST_PointFromText('POINT($lat $lng)'), driver_area)"), '>=', 1
+//        )
+//            ->select('user_id')
+//            ->first();
+//
+//
+//        if (!empty($driverQuery)) {
+//            $driverId = $driverQuery->user_id;
+//        }
+        $order = new Order();
+        $lastOrder = $order->orderBy('id', 'DESC')->first();
+        $order->lat_lng = new Point($lat, $lng);
+        $order->user_id = \Auth::id();
+        $order->invoice_num = (!empty($lastOrder)) ? $lastOrder->id + 1 : 1;
+        $order->delivery_time = $request->get('delivery_time');
+        $order->pickup_time = $request->get('pickup_time');
+        $order->payment_method = $request->get('payment_method');
+        $order->address = $request->get('address');
+        $order->skip_by_client = '1';
+        $order->user_comments = empty($request->get('user_comments')) ? NULL : $request->get('user_comments');
+        $order->driver_id = $request->get('driver_id');//($driverId == 0) ? $request->get('driver_id') : $driverId;
+        $order->total = \Config::get('constants.sorting_fee') + \Config::get('constants.delivery_charges');
+        $order->subtotal = 0;
+        $order->delivery_charges = \Config::get('constants.delivery_charges');
+        $order->sorting_fee = \Config::get('constants.sorting_fee');
+        $order->coupon_id = $couponId;
+        $order->orderstatus_id = Order::PENDING;
+        $order->save();
+        event(new orderCreate($order));
+        return response()->json(['order' => $order,
+            'message' => trans('order.skip.success_message'),
+            'message_title' => trans('order.skip.success_message_title'),
+        ]);
+    }
+
+    /**
+     * Pickup and Delievery time
+     * @param GetOrderTimeFormatRequest $request
+     * @return \Illuminate\Http\JsonResponse
+     */
+    public function sendValidTime(GetOrderTimeFormatRequest $request)
+    {
+        $shopSettings = Setting::where('id', '>', 0)->first();
+        $shopOpenTime = $shopSettings->open_time;
+        $shopCloseTime = $shopSettings->close_time;
+        $data['all_days_time'] = [];
+        for ($i = $shopOpenTime; $i < $shopCloseTime; $i++) {
+            $nextHr = $i + 1;
+            $nextHrTime = date("ha", strtotime("00-00-00  $nextHr:00:00"));
+            $currentHrTime = date("ha", strtotime("00-00-00 $i:00:00"));
+            $data['all_days_time'][] = $currentHrTime . '-' . $nextHrTime;
+        }
+        $date['current_day_time'] = [];
+        $currentHr = $request->get('current_hr') + 1;
+        for ($i = $currentHr; $i < $shopCloseTime; $i++) {
+            if ($i < $shopOpenTime) {
+                continue;
+            }
+            $nextHr = $i + 1;
+            $nextHrTime = date("ha", strtotime("00-00-00  $nextHr:00:00"));
+            $currentHrTime = date("ha", strtotime("00-00-00 $i:00:00"));
+            $data['current_day_time'][] = $currentHrTime . '-' . $nextHrTime;
+        }
+        $data['open_time'] = $shopOpenTime;
+        $data['close_time'] = $shopCloseTime;
+        $data['delievery_gap_in_hr'] = $shopSettings->delievery_margin;
+        return response()->json($data);
+    }
+
+    /**
+     * Pickup and Delievery time
+     * @param GetOrderTimeFormatRequest $request
+     * @return \Illuminate\Http\JsonResponse
+     */
+    public function sendValidTimeNew(GetOrderTimeFormatRequest $request)
+    {
+        $location_id = $request->get('location_id');
+        $shopSettings = Location::find($location_id);
+        $shopOpenTime = $shopSettings->open_time;
+        $shopCloseTime = $shopSettings->close_time;
+        $data['all_days_time'] = [];
+        for ($i = $shopOpenTime; $i < $shopCloseTime; $i++) {
+            $nextHr = $i + 1;
+            $nextHrTime = date("ha", strtotime("00-00-00  $nextHr:00:00"));
+            $currentHrTime = date("ha", strtotime("00-00-00 $i:00:00"));
+            $data['all_days_time'][] = $currentHrTime . '-' . $nextHrTime;
+        }
+        $date['current_day_time'] = [];
+        $currentHr = $request->get('current_hr') + 1;
+        for ($i = $currentHr; $i < $shopCloseTime; $i++) {
+            if ($i < $shopOpenTime) {
+                continue;
+            }
+            $nextHr = $i + 1;
+            $nextHrTime = date("ha", strtotime("00-00-00  $nextHr:00:00"));
+            $currentHrTime = date("ha", strtotime("00-00-00 $i:00:00"));
+            $data['current_day_time'][] = $currentHrTime . '-' . $nextHrTime;
+        }
+        $data['open_time'] = $shopOpenTime;
+        $data['close_time'] = $shopCloseTime;
+        $data['delievery_gap_in_hr'] = $shopSettings->delievery_margin;
+        return response()->json($data);
+    }
+
+    public
+    function sendNotification($orderId)
+    {
+        $order = Order::where('id', $orderId)
+            ->with(['user', 'status', 'driver', 'detail' => function ($q) {
+                $q->with('product', 'service');
+            }])
+            ->first()
+            ->toArray();
+        $pushRes = $this->sendPushMessage($order);
+        return response()->json($pushRes);
+    }
+    /**
+     * Send notification to customer regarding his order status
+     * @param $order - Must have user, driver and status
+     * @return bool|\Illuminate\Http\JsonResponse
+     */
+    public
+    function sendPushMessage($order)
+    {
+        $statusText = $order['status'];
+        $deviceToken = array_column(Device::whereIn('deviceable_id', [$order['user_id'],$order['driver_id']])
+            ->get(['device_token'])
+            ->toArray(), 'device_token');
+        if (empty($deviceToken)) {
+            return false;
+        }
+        $statusText['status_description'] = \Config::get('constants.default_pushnoti');
+
+        return sendPushNotificationToFCMSever($deviceToken, $statusText['status_description'], $order['id']);
+    }
+
+}

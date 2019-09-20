@@ -1,0 +1,316 @@
+<?php
+
+namespace App\Http\Controllers\Api\V1\Driver;
+
+use App\Http\Requests\Driver\ClientOrderUpdatePushMessageRequest;
+use App\Http\Requests\Driver\DeleteOrderDetailRequest;
+use App\Http\Requests\Driver\GetOrderDetailFormDataRequest;
+use App\Http\Requests\Driver\GetOrdersRequest;
+use App\Http\Requests\Driver\InsertOrderDetailRequest;
+use App\Http\Requests\Driver\UpdateOrderRequest;
+use App\Models\Device\Device;
+use App\Models\Order\Order;
+use App\Models\Orderdetail\Orderdetail;
+use App\Models\Orderstatus\Orderstatus;
+use App\Models\Product\Product;
+use App\Models\ProductService\ProductService;
+use App\Models\Service\Service;
+use Illuminate\Http\Request;
+use App\Http\Controllers\Controller;
+use App\Http\Controllers\Backend\Order\OrdersController As BackEndOrderController;
+use App\Repositories\Backend\Order\OrderRepository;
+
+/**
+ * @resource Driver App
+ *
+ * All orders related functions
+ */
+class DriverOrderController extends Controller
+{
+    /**
+     * Display all availible statuses.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function getStatuses()
+    {
+        $data['statuses'] = Orderstatus::get(['id', 'status']);
+        return response()->json($data);
+    }
+
+    /**
+     * Display a listing of the orders with status.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function getDriverOrders(GetOrdersRequest $request)
+    {
+        $orderStatus = $request->get('status');
+        $orderStatusId = $this->getStatusIdFromText($orderStatus);
+        $orders = Order::with(['detail' => function ($q) {
+            $q->with(['product' => function ($q1) {
+                $q1->select('id', 'name');
+            }, 'service' => function ($q2) {
+                $q2->select('id', 'name');
+            }]);
+        }, 'user', 'status'])
+            ->where('driver_id', \Auth::id())
+            ->where('orderstatus_id', $orderStatusId);
+        //->has('detail', '>=', 1);
+        if ($orderStatusId == Order::PENDING || $orderStatusId == Order::JUST_ORDERED) {
+            $orders->whereIn('orderstatus_id', [
+                Order::JUST_ORDERED, Order::PENDING
+            ]);
+        }
+
+        $orders = $orders->get();
+        $data['orders'] = $orders;
+        $formatRes = [];
+        foreach ($data['orders'] as $key => $val) {
+            $formatRes[$key] = $val;
+            if (!empty($val['detail'])) {
+                foreach ($val['detail'] as $k1 => $v1) {
+                    $formatRes[$key]['detail'][$k1]['product_name'] = $v1['product']['name'];
+                    $formatRes[$key]['detail'][$k1]['service_name'] = $v1['service']['name'];
+                }
+            }
+        }
+        $data['orders'] = $formatRes;
+        return response()->json($data);
+    }
+
+    /**
+     * Display the specified resource.
+     *
+     * @param  int $id
+     * @return \Illuminate\Http\Response
+     */
+    public function getOrderById($id)
+    {
+        //$order = new Order();
+        $order = Order::where('id', $id)
+            ->with(['status' => function ($q1) {
+                $q1->select('id', 'status_description', 'status_description_ar');
+            }, 'detail' => function ($q) {
+                $q->with('product', 'service');
+            }])->first();
+        $order->skipMutator = true;
+        $order->formatPickupAsClientApp = true;
+        $order->formatDeliveryAsClientApp = true;
+        $order->convertIntToDouble = true;
+        return response()->json($order);
+    }
+
+    /**
+     * Update order.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function updateOrder(UpdateOrderRequest $request)
+    {
+        $order = Order::find($request->get('order_id'));
+        $order->orderstatus_id = $request->get('orderstatus_id');
+//        $order->pickup_time = $request->get('pickup_time');
+//        $order->delivery_time = $request->get('delivery_time');
+        $order->save();
+        $data['order'] = $order;
+        return response()->json($order);
+    }
+
+
+    public function getStatusIdFromText($statusTxt)
+    {
+        $orderStatusId = $statusTxt;
+        if (!is_numeric($statusTxt)) {
+            switch ($statusTxt) {
+                case 'completed':
+                    $orderStatusId = Order::COMPLETED;
+                    break;
+                case 'pending':
+                    $orderStatusId = Order::PENDING;
+                    break;
+                case 'cancelled':
+                    $orderStatusId = Order::CANCELLED;
+                    break;
+                case 'just_ordered':
+                    $orderStatusId = Order::JUST_ORDERED;
+                    break;
+                case 'received':
+                    $orderStatusId = Order::RECEIVED;
+                    break;
+                case 'in-progress':
+                    $orderStatusId = Order::IN_PROGRESS;
+                    break;
+                case 'delivered':
+                    $orderStatusId = Order::DELIVERED;
+                    break;
+                case 'ready-for-delivery':
+                    $orderStatusId = Order::READY_FOR_DELIVERY;
+                    break;
+                default:
+                    $orderStatusId = 0;
+            }
+        }
+        return $orderStatusId;
+    }
+
+    /**
+     * Delete single order detail.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function deleteOrderDetail(DeleteOrderDetailRequest $request)
+    {
+        $orderRepositry = new OrderRepository();
+        $backEndOrderController = new BackEndOrderController($orderRepositry);
+        return $backEndOrderController->deleteOrderDetail($request);
+    }
+
+    /**
+     * Insert single order detail.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function insertOrderDetail(InsertOrderDetailRequest $request)
+    {
+        $orderRepositry = new OrderRepository();
+        $backEndOrderController = new BackEndOrderController($orderRepositry);
+        $couponInfo = [];
+        $couponInfo['discount'] = 0;
+        $orderId = $request->get('order_id');
+        $orderSummery = Order::find($orderId);
+        $laundryPrice = 0;
+        $orderDetail = [];
+        if (!empty($request->get('product_id'))) {
+            $orderDetail['product_id'] = $request->get('product_id');
+            $orderDetail['service_id'] = $request->get('service_id');
+            $orderDetail['qty'] = $request->get('qty');
+            $orderDetail['price'] = $request->get('paid_price');
+            $orderDetail['paid_price'] = $request->get('paid_price');
+            if ($request->has('laundry_price') && $request->get('laundry_price') > 0) {
+                $orderDetail['total_paid_laundry_price'] = $request->get('laundry_price') * $orderDetail['qty'];
+            } else {
+                $servicePrice = ProductService::where('product_id', $request->get('product_id'))
+                    ->where('service_id', $request->get('service_id'))
+                    ->first();
+                if ($servicePrice) {
+                    $orderDetail['total_paid_laundry_price'] = $servicePrice->laundry_price * $orderDetail['qty'];
+                } else {
+                    $orderDetail['total_paid_laundry_price'] = 0;
+                }
+            }
+            $orderDetail['total_paid_price'] = $request->get('paid_price') * $orderDetail['qty'];
+            $orderDetail['added_by'] = \Auth::id();
+            $orderDetail['order_id'] = $orderId;
+            Orderdetail::create($orderDetail);
+        }
+        //Apply coupon
+        //if ($request->has('coupon_code')) {
+        $couponInfo = $backEndOrderController->applyCoupon($request->get('coupon_code'), $backEndOrderController->getOrderOrignalPrice($orderId));
+        $orderSummery->discount = $couponInfo['discount_val'];
+        $orderSummery->discount_type = $couponInfo['discount_type'];
+        //}
+        //dd($couponInfo);
+        $orderSummery->coupon_id = (!empty($couponInfo)) ? $couponInfo['coupon_id'] : NULL;
+
+        //$orderSummery->orderstatus_id = $request->get('orderstatus_id');
+        //$orderSummery->delivery_charges = $request->get('delivery_charges');
+        //$orderSummery->pickup_time = $request->get('pickup_time');
+        //$orderSummery->delivery_time = $request->get('delivery_time');
+        $orderSummery->subtotal = $backEndOrderController->getOrderOrignalPrice($orderId);
+        $orderSummery->total = ($backEndOrderController->getOrderOrignalPrice($orderId)
+                + (double)$orderSummery->delivery_charges
+                + (double)$orderSummery->sorting_fee) - $couponInfo['applied_discount'];
+        $orderSummery->save();
+        //Update in orders
+        $backEndOrderController->updateMainOrderFromDetail($orderId);
+
+        $data['order'] = Order::where('id', $orderId)->with('detail', 'user', 'status')->first();
+        return response()->json(
+            [
+                'success' => true,
+                'order' => $data
+            ]
+        );
+    }
+
+    /**
+     * Get form data for add order detail
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function addOrderDetailFormData(GetOrderDetailFormDataRequest $request)
+    {
+        $orderId = $request->get('order_id');
+        $order = Order::find($orderId)->with(['detail' => function ($q) {
+            $q->with(['product' => function ($q1) {
+                $q1->with(['services' => function ($q2) {
+                    $q2->select('service_id', 'price', 'discount_price', 'laundry_price', 'name');
+                }]);
+            }, 'service:id']);
+        }, 'user', 'driver'])->where('id', $orderId)->get();
+
+        if (!empty($order['detail'])) {
+            $productsInOrder = array_column($order['detail']->toArray(), 'product_id');
+        } else {
+            $productsInOrder = [];
+        }
+
+        $data['products'] = Product::with(['services' => function ($q2) {
+            $q2->select('service_id', 'price', 'discount_price', 'name', 'laundry_price');
+        }])
+            ->whereNotIn('id', $productsInOrder)
+            ->get()->toArray();
+        return response()->json($data);
+    }
+
+    /**
+     * Update client via push message
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function sendPushMessageToClient(ClientOrderUpdatePushMessageRequest $request)
+    {
+//        $orderRepositry = new OrderRepository();
+//        $backEndOrderController = new BackEndOrderController($orderRepositry);
+//        $backEndOrderController->sendNotification($request);
+
+        $orderId = $request->get('order_id');
+        $order = Order::where('id', $orderId)
+            ->with(['user', 'status', 'driver', 'detail' => function ($q) {
+                $q->with('product', 'service');
+            }])
+            ->first()
+            ->toArray();
+        $deviceToken = array_column(Device::where('deviceable_id', $order['user_id'])
+            ->get(['device_token'])
+            ->toArray(), 'device_token');
+        if (empty($deviceToken)) {
+
+        } else {
+            sendPushNotificationToFCMSever($deviceToken,
+                \Config::get('constants.default_pushnoti'),
+                $order['id']);
+        }
+        return response()->json([
+            'success' => true,
+            'message' => 'Notification sent successfully'
+        ]);
+    }
+
+    /**
+     * Send invoice to client email
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function emailInvoiceToClient(ClientOrderUpdatePushMessageRequest $request)
+    {
+        $orderRepositry = new OrderRepository();
+        $backEndOrderController = new BackEndOrderController($orderRepositry);
+        $backEndOrderController->sendReciept($request);
+        return response()->json([
+            'success' => true,
+            'message' => 'Notification sent successfully'
+        ]);
+    }
+}

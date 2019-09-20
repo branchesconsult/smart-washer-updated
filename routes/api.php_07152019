@@ -1,0 +1,94 @@
+<?php
+
+
+/*
+|--------------------------------------------------------------------------
+| API Routes
+|--------------------------------------------------------------------------
+|
+| Here is where you can register API routes for your application. These
+| routes are loaded by the RouteServiceProvider within a group which
+| is assigned the "api" middleware group. Enjoy building your API!
+|
+*/
+
+Route::group(['namespace' => 'Api\V1', 'prefix' => 'v1', 'as' => 'v1.', 'middleware' => ['sessions']], function () {
+
+
+    Route::get('statuses', 'Driver\DriverOrderController@getStatuses');
+    Route::post('get-operationals-hr', 'OrderController@sendValidTime');
+
+    Route::post('password/email', 'ForgotPasswordController@sendResetLinkEmail');
+    /**
+     * Site settings
+     */
+    Route::resource('settings', 'SettingController', ['only' => ['index']]);
+    /**
+     * Products
+     */
+    Route::resource('category', 'CategoryController', ['only' => ['index']]);
+    Route::get('price-list', 'CategoryController@priceList');
+    /**
+     * Auth
+     */
+    Route::post('register', 'RegisterController@register');
+    Route::post('login', 'AuthController@login');
+    Route::post('social-login', 'RegisterController@socialLogin');
+    // Page
+    Route::resource('pages', 'PagesController', ['only' => ['index', 'show']]);
+    // Faqs
+    Route::resource('faqs', 'FaqsController', ['only' => ['index', 'show']]);
+    Route::group(['middleware' => ['jwt.auth']], function () {
+        Route::post('logout', 'AuthController@logout');
+        Route::post('refresh', 'AuthController@refresh');
+//        // Password Reset Routes
+//        Route::post('password/email', 'ForgotPasswordController@sendResetLinkEmail');
+//        Route::post('password/reset', 'ResetPasswordController@reset')->name('password.reset');
+        // Users
+        //Route::resource('users', 'UsersController', ['except' => ['create', 'edit', 'destroy']]);
+        Route::post('update-me', 'UsersController@update');
+        Route::post('change-password', 'UsersController@updatePassword');
+        Route::resource('addresses', 'AddressController', ['only' => [
+            'index', 'store', 'destroy'
+        ]]);
+        Route::post('addresses/{id}', 'AddressController@update');
+        //Route::post('users/delete-all', 'UsersController@deleteAll');
+        //@todo need to change the route name and related changes
+        //Route::get('deactivated-users', 'DeactivatedUsersController@index');
+        //Route::get('deleted-users', 'DeletedUsersController@index');
+
+        // Roles
+        //Route::resource('roles', 'RolesController', ['except' => ['create', 'edit']]);
+        //Route::post('roles/delete-all', 'RolesController@deleteAll');
+
+        // Permission
+        //Route::resource('permissions', 'PermissionController', ['except' => ['create', 'edit']]);
+        Route::resource('order', 'OrderController', ['only' => ['index', 'store', 'show', 'update']]);
+        Route::post('skip-order', 'OrderController@skipOrderProcess');
+        Route::get('client-orders', 'OrderController@clientOrders');
+        Route::post('order-complain', 'OrderController@orderComplain');
+        Route::resource('coupon', 'CouponController', ['only' => ['validateCoupon']]);
+        Route::post('coupon/validate', 'CouponController@validateCoupon');
+        Route::post('get-driver', 'OrderController@checkDriver');
+        // Blog Categories
+        //Route::resource('blog_categories', 'BlogCategoriesController', ['except' => ['create', 'edit']]);
+
+        // Blog Tags
+        //Route::resource('blog_tags', 'BlogTagsController', ['except' => ['create', 'edit']]);
+
+        // Blogs
+        //Route::resource('blogs', 'BlogsController', ['except' => ['create', 'edit']]);
+        //Drivers orders
+        Route::group(['namespace' => 'Driver', 'prefix' => 'driver-app'], function () {
+            Route::get('orders', 'DriverOrderController@getDriverOrders');
+            Route::get('statuses', 'DriverOrderController@getStatuses');
+            Route::post('order/update', 'DriverOrderController@updateOrder');
+            Route::post('order-detail/delete', 'DriverOrderController@deleteOrderDetail');
+            Route::post('order-detail/add', 'DriverOrderController@insertOrderDetail');
+            Route::post('order-detail/get-form-data', 'DriverOrderController@addOrderDetailFormData');
+            Route::post('order/client-push-message', 'DriverOrderController@sendPushMessageToClient');
+            Route::post('order/client-invoice-email', 'DriverOrderController@emailInvoiceToClient');
+            Route::get('order/{order_id}', 'DriverOrderController@getOrderById');
+        });
+    });
+});

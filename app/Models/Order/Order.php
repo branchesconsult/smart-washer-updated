@@ -1,0 +1,182 @@
+<?php
+
+namespace App\Models\Order;
+
+use App\Models\ModelTrait;
+use Carbon\Carbon;
+use Grimzy\LaravelMysqlSpatial\Eloquent\SpatialTrait;
+use Illuminate\Database\Eloquent\Builder AS EloquentBuilder;
+use Illuminate\Database\Eloquent\Model;
+use App\Models\Order\Traits\OrderAttribute;
+use App\Models\Order\Traits\OrderRelationship;
+
+class Order extends Model
+{
+    use ModelTrait,
+        OrderAttribute,
+        SpatialTrait,
+        OrderRelationship {
+        // OrderAttribute::getEditButtonAttribute insteadof ModelTrait;
+    }
+    public $skipMutator = false;
+    public $formatPickupAsClientApp = false;
+    public $formatDeliveryAsClientApp = false;
+    public $convertIntToDouble = false;
+    protected $spatialFields = [
+        'lat_lng'
+    ];
+    /**
+     * NOTE : If you want to implement Soft Deletes in this model,
+     * then follow the steps here : https://laravel.com/docs/5.4/eloquent#soft-deleting
+     */
+
+    /**
+     * The database table used by the model.
+     * @var string
+     */
+    protected $table = 'orders';
+
+    const JUST_ORDERED = 1;
+    const PENDING = 2;
+    const RECEIVED = 3;
+    const IN_PROGRESS = 4;
+    const READY_FOR_DELIVERY = 5;
+    const DELIVERED = 6;
+    const CANCELLED = 7;
+    const COMPLETED = 8;
+    /**
+     * Default values for model fields
+     * @var array
+     */
+    protected $attributes = [
+
+    ];
+
+    /**
+     * Dates
+     * @var array
+     */
+    protected $dates = [
+        'created_at',
+        'updated_at'
+    ];
+    protected $casts = [
+        'pickup_time' => 'string',
+        'created_at' => 'string',
+        'delivery_time' => 'string',
+//        'delivery_charges' => 'float',
+//        'sorting_fee' => 'float'
+    ];
+    /**
+     * Guarded fields of model
+     * @var array
+     */
+    protected $guarded = [
+    ];
+
+    /**
+     * Constructor of Model
+     * @param array $attributes
+     */
+    public function __construct(array $attributes = [])
+    {
+        parent::__construct($attributes);
+    }
+
+    public function setDeliveryTimeAttribute($date)
+    {
+        $this->attributes['delivery_time'] = Carbon::parse($date);
+    }
+
+    public function setPickupTimeAttribute($date)
+    {
+        $this->attributes['pickup_time'] = Carbon::parse($date);
+    }
+
+    public function setInvoiceNumAttribute($val)
+    {
+        $this->attributes['invoice_num'] = invoice_num($val, 10, "F-");
+    }
+
+    /**
+     * The "booting" method of the model.
+     *
+     * @return void
+     */
+    protected static function boot()
+    {
+        parent::boot();
+        static::addGlobalScope('orderById', function (EloquentBuilder $builder) {
+            $builder->orderBy('id', 'DESC');
+        });
+    }
+
+    public function getGlobalDateTimeFormat($dateTime)
+    {
+        if ($this->skipMutator == true) {
+            return $dateTime;
+        }
+        return Carbon::parse($dateTime)->toDayDateTimeString();
+
+    }
+
+    public function getPickupTimeAttribute($val)
+    {
+        //return $this->getGlobalDateTimeFormat($val);
+        if ($this->formatPickupAsClientApp === true) {
+            $initialHr = date('Ha', strtotime($val));
+            $nextHr = date('Ha', strtotime($val . '+1 hour'));
+            return date('Y-m-d', strtotime($val)) . ', ' . $initialHr . '-' . $nextHr;
+        } else {
+            return $this->getGlobalDateTimeFormat($val);
+        }
+    }
+
+    public function getCreatedAtAttribute($val)
+    {
+        return $this->getGlobalDateTimeFormat($val);
+    }
+
+
+    public function getDeliveryTimeAttribute($val)
+    {
+        //return $this->getGlobalDateTimeFormat($val);
+        if ($this->formatDeliveryAsClientApp === true) {
+            $initialHr = date('Ha', strtotime($val));
+            $nextHr = date('Ha', strtotime($val . '+1 hour'));
+            return date('Y-m-d', strtotime($val)) . ', ' . $initialHr . '-' . $nextHr;
+        } else {
+            return $this->getGlobalDateTimeFormat($val);
+        }
+    }
+
+    protected function upperRound($val)
+    {
+        return round($val,2);
+    }
+
+    public function getSubTotalAttribute($val)
+    {
+        return $this->upperRound($val);
+    }
+
+    public function getTotalAttribute($val)
+    {
+        return $this->upperRound($val);
+    }
+
+    public function getLaundryTotalPriceAttribute($val)
+    {
+        return $this->upperRound($val);
+    }
+
+    public function getSortingFeeAttribute($val)
+    {
+        return $this->upperRound($val);
+    }
+
+    public function getDeliveryChargesAttribute($val)
+    {
+        return $this->upperRound($val);
+    }
+}
